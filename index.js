@@ -1,88 +1,126 @@
-import { Telegraf } from 'telegraf';
-import baileys from '@whiskeysockets/baileys';
-import sqlite3 from 'sqlite3';
+import { Telegraf, Markup } from 'telegraf';
 import { open } from 'sqlite';
+import sqlite3 from 'sqlite3';
 import pino from 'pino';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import express from 'express';
+import { default as makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } from '@whiskeysockets/baileys';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const app = express();
+const botTelegram = new Telegraf("8605832073:AAEA5JwyvjRZj0yHGTZ-paBIKDS0PNfRjM0");
 
-const { makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = baileys.default || baileys;
+// --- CONFIGURAÇÃO ---
+const DONO_ID = 123456789; // COLOQUE SEU ID DO TELEGRAM AQUI
 
-// --- CONFIGURAÇÕES ---
-const TELEGRAM_TOKEN = 'SEU_TOKEN_AQUI'; // Pegue no @BotFather
-const canalLog = "120363339031174676@newsletter";
-const grupoLog = "F9mebHrNzLP1cOAC2NkA0Z@g.us";
-
-const botTelegram = new Telegraf(TELEGRAM_TOKEN);
 let sock;
 let db;
+let estado = { etapa: '', destino: '' };
 
-async function iniciarTudo() {
-    // 1. Banco de Dados
-    db = await open({ filename: path.join(__dirname, 'database.db'), driver: sqlite3.Database });
-    await db.exec(`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, nome TEXT)`);
+async function initDb() {
+    db = await open({ filename: './database.db', driver: sqlite3.Database });
+    await db.exec(`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, nome TEXT, idade TEXT)`);
+}
 
-    // 2. Estado do WhatsApp
-    const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'auth_info'));
-    const { version } = await fetchLatestBaileysVersion();
+// --- FLUXO TELEGRAM ---
+botTelegram.start((ctx) => {
+    if (ctx.from.id !== DONO_ID) return;
+    
+    ctx.reply(`👋 Olá! Entre nos links abaixo para liberar o sistema:`, 
+    Markup.inlineKeyboard([
+        [Markup.button.url('📢 Canal', 'https://t.me/+fJHK4uBEE3AyZmUx')],
+        [Markup.button.url('💬 Chat', 'https://t.me/sem_nome123456')],
+        [Markup.button.callback('✅ Verificar', 'menu_id')]
+    ]));
+});
 
+botTelegram.action('menu_id', (ctx) => {
+    ctx.reply('Onde os registros serão postados?', 
+    Markup.inlineKeyboard([
+        [Markup.button.callback('ID Canal', 'set_canal')],
+        [Markup.button.callback('ID Chat', 'set_chat')],
+        [Markup.button.callback('ID Canal + Chat', 'set_ambos')]
+    ]));
+});
+
+botTelegram.action(['set_canal', 'set_chat', 'set_ambos'], (ctx) => {
+    estado.etapa = 'esperando_id';
+    ctx.reply('Mande o ID do local escolhido:');
+});
+
+botTelegram.on('text', async (ctx) => {
+    if (ctx.from.id !== DONO_ID) return;
+
+    if (estado.etapa === 'esperando_id') {
+        estado.destino = ctx.message.text;
+        estado.etapa = '';
+        return ctx.reply(`✅ ID ${estado.destino} configurado!\nPronto para parear o WhatsApp?`, 
+        Markup.inlineKeyboard([[Markup.button.callback('🔗 CONECTAR', 'conectar_wa')]]));
+    }
+
+    if (estado.etapa === 'esperando_numero') {
+        const num = ctx.message.text.replace(/\D/g, '');
+        ctx.reply('⏳ Solicitando código para o número...');
+        try {
+            const code = await sock.requestPairingCode(num);
+            ctx.reply(`🔑 CÓDIGO DE PAREAMENTO:\n\n*${code.toUpperCase()}*\n\nAbra o WhatsApp > Aparelhos Conectados > Conectar com número de telefone.`, { parse_mode: 'Markdown' });
+            estado.etapa = '';
+        } catch (e) {
+            ctx.reply('❌ Erro ao gerar código. Tente novamente.');
+        }
+    }
+});
+
+botTelegram.action('conectar_wa', (ctx) => {
+    estado.etapa = 'esperando_numero';
+    ctx.reply('📱 *Coloque seu número como dono no canal e no chat*\n\nExemplo: 55519XXXXXXXX', { parse_mode: 'Markdown' });
+});
+
+// --- LÓGICA WHATSAPP ---
+async function startWA() {
+    const { state, saveCreds } = await useMultiFileAuthState('sessao_viana');
     sock = makeWASocket({
-        version,
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        browser: ["Ubuntu", "Chrome", "20.0.0"]
+        browser: Browsers.ubuntu('Chrome'),
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // --- LÓGICA DO WHATSAPP (REGISTRO NO PRIVADO) ---
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe || msg.key.remoteJid.includes('@g.us')) return;
 
         const jid = msg.key.remoteJid;
-        const nome = msg.pushName || "Usuário";
-        const texto = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-
-        // Verifica se é o primeiro contato (Registro Automático)
+        const txt = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
         const user = await db.get('SELECT * FROM users WHERE id = ?', [jid]);
 
         if (!user) {
-            // Salva no Banco
-            await db.run('INSERT INTO users (id, nome) VALUES (?, ?)', [jid, nome]);
-            
-            // Responde ao usuário
-            await sock.sendMessage(jid, { text: `Olá ${nome}! Você foi registrado automaticamente em nosso sistema. ✅` });
+            if (txt.toLowerCase().startsWith('/registrar')) {
+                const p = txt.split(' ');
+                if (p.length < 3) return sock.sendMessage(jid, { text: "Use: /registrar Nome Idade" });
 
-            // Envia Log para Canal e Grupo
-            const logMsg = `📢 *NOVO REGISTRO PRIVADO*\n\n👤 *Nome:* ${nome}\n🆔 *Número:* ${jid.split('@')[0]}`;
-            await sock.sendMessage(canalLog, { text: logMsg }).catch(() => {});
-            await sock.sendMessage(grupoLog, { text: logMsg }).catch(() => {});
+                const nome = p[1], idade = p[2], serial = Math.random().toString(16).slice(2, 8), data = new Date().toLocaleString('pt-BR');
+                await db.run('INSERT INTO users (id, nome, idade) VALUES (?, ?, ?)', [jid, nome, idade]);
+
+                const layout = `╭───• *NOVO REGISTRO* •───\n├⎆ *Status:* _*Sucesso ✓*_\n├⎆ *Nome:* ${nome} ㅤㅤ#venomㅤㅤ#gothangelz\n├⎆ *Idade:* ${idade}\n├⎆ *Serial:* ***${serial}***\n├⎆ *Data:* ${data}\n╰───────────────`;
+
+                let foto;
+                try { foto = await sock.profilePictureUrl(jid, 'image'); } catch { foto = 'https://ui-avatars.com/api/?name=' + nome; }
+
+                if (estado.destino) {
+                    await botTelegram.telegram.sendPhoto(estado.destino, { url: foto }, { caption: layout, parse_mode: 'Markdown' });
+                }
+                await sock.sendMessage(jid, { text: "✅ Registro Concluído!" });
+            } else {
+                await sock.sendMessage(jid, { text: "❌ *Acesso Negado!*\n\n👉 Digite: */registrar Nome Idade*" });
+            }
         }
     });
-
-    console.log("🤖 Sistemas iniciados...");
 }
 
-// --- COMANDOS DO TELEGRAM ---
-botTelegram.start((ctx) => ctx.reply('Use /conectar [numero] para vincular o WhatsApp.'));
-
-botTelegram.command('conectar', async (ctx) => {
-    const numero = ctx.message.text.split(' ')[1];
-    if (!numero) return ctx.reply('Digite o número: /conectar 555194583978');
-
-    try {
-        const code = await sock.requestPairingCode(numero.replace(/\D/g, ''));
-        ctx.reply(`✅ CÓDIGO PARA WHATSAPP:\n\n👉 ${code.toUpperCase()}`);
-    } catch (e) {
-        ctx.reply('Erro: ' + e.message);
-    }
+// Inicia Servidores
+app.get('/', (req, res) => res.send('Bot Viana Online'));
+app.listen(3000, async () => {
+    await initDb();
+    startWA();
+    botTelegram.launch();
 });
-
-// Iniciar
-iniciarTudo();
-botTelegram.launch();
