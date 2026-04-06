@@ -86,7 +86,7 @@ async function startWA() {
     sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'),
+        browser: browser: ["Mac OS", "Safari", "15.1"],
     });
 
     sock.ev.on('creds.update', saveCreds);
