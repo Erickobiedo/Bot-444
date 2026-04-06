@@ -6,12 +6,11 @@ import express from 'express';
 import { default as makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } from '@whiskeysockets/baileys';
 
 const app = express();
-// Token do seu bot do Telegram
+// Substitua pelo seu Token real do BotFather
 const botTelegram = new Telegraf("8605832073:AAFhV8WjcWSFuTScFTV_d6SybyKERAaROII");
 
 let sock;
 let db;
-// Objeto para armazenar as etapas de cada utilizador individualmente
 let estadosUsuarios = {}; 
 
 async function initDb() {
@@ -19,21 +18,21 @@ async function initDb() {
     await db.exec(`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, nome TEXT, idade TEXT)`);
 }
 
-// --- FLUXO TELEGRAM (LIBERADO PARA TODOS) ---
+// --- INTERFACE TELEGRAM (ABERTO A TODOS) ---
 botTelegram.start((ctx) => {
     const userId = ctx.from.id;
     estadosUsuarios[userId] = { etapa: '', destino: '' };
 
-    ctx.reply(`👋 Bem-vindo ao Sistema Viana!\n\nEntre nos canais abaixo para libertar o seu acesso:`, 
+    ctx.reply(`👋 Bem-vindo ao Sistema Viana!\n\nEntre nos canais para liberar o acesso:`, 
     Markup.inlineKeyboard([
         [Markup.button.url('📢 Canal', 'https://t.me/+fJHK4uBEE3AyZmUx')],
         [Markup.button.url('💬 Chat', 'https://t.me/sem_nome123456')],
-        [Markup.button.callback('✅ Verificar e Entrar', 'menu_id')]
+        [Markup.button.callback('✅ Verificar e Configurar', 'menu_id')]
     ]));
 });
 
 botTelegram.action('menu_id', (ctx) => {
-    ctx.reply('Onde deseja receber os logs de registro?', 
+    ctx.reply('Onde os logs de registro serão postados?', 
     Markup.inlineKeyboard([
         [Markup.button.callback('ID Canal', 'set_canal')],
         [Markup.button.callback('ID Chat', 'set_chat')],
@@ -44,7 +43,7 @@ botTelegram.action('menu_id', (ctx) => {
 botTelegram.action(['set_canal', 'set_chat', 'set_ambos'], (ctx) => {
     const userId = ctx.from.id;
     estadosUsuarios[userId].etapa = 'esperando_id';
-    ctx.reply('Mande agora o ID do local (ex: -100...):');
+    ctx.reply('Mande o ID do local (Ex: -100... ou o JID do WhatsApp):');
 });
 
 botTelegram.on('text', async (ctx) => {
@@ -53,23 +52,32 @@ botTelegram.on('text', async (ctx) => {
 
     if (!estadosUsuarios[userId]) estadosUsuarios[userId] = { etapa: '', destino: '' };
 
+    // Configuração do ID de destino
     if (estadosUsuarios[userId].etapa === 'esperando_id') {
         estadosUsuarios[userId].destino = txtMsg;
         estadosUsuarios[userId].etapa = '';
-        return ctx.reply(`✅ Destino configurado: ${txtMsg}\n\nPronto para conectar o seu WhatsApp?`, 
+        return ctx.reply(`✅ Destino configurado: ${txtMsg}\n\nPronto para conectar o WhatsApp?`, 
         Markup.inlineKeyboard([[Markup.button.callback('🔗 CONECTAR AGORA', 'conectar_wa')]]));
     }
 
+    // Geração do código de pareamento
     if (estadosUsuarios[userId].etapa === 'esperando_numero') {
         const num = txtMsg.replace(/\D/g, '');
-        ctx.reply('⏳ A gerar código de pareamento...');
+        if (num.length < 10) return ctx.reply("❌ Número inválido. Use o formato: 5551994583978");
+
+        ctx.reply('⏳ Solicitando código ao WhatsApp... (Aguarde 5s)');
+        
         try {
-            // Gera o código de 8 dígitos para o número enviado
+            // Delay preventivo para evitar bloqueio de IP
+            await new Promise(res => setTimeout(res, 5000));
+            
             const code = await sock.requestPairingCode(num);
-            ctx.reply(`🔑 O SEU CÓDIGO É:\n\n*${code.toUpperCase()}*\n\nInstruções:\n1. Abra o WhatsApp\n2. Dispositivos Associados\n3. Associar com número de telefone\n4. Digite o código acima`, { parse_mode: 'Markdown' });
+            ctx.reply(`🔑 SEU CÓDIGO DE CONEXÃO:\n\n*${code.toUpperCase()}*\n\nAbra o WhatsApp > Aparelhos Conectados > Conectar com número.`, { parse_mode: 'Markdown' });
+            console.log(`✅ Código gerado para ${num}: ${code}`);
             estadosUsuarios[userId].etapa = '';
         } catch (e) {
-            ctx.reply('❌ Erro ao gerar código. Verifique o número e tente novamente.');
+            console.error("❌ ERRO AO GERAR CÓDIGO:", e);
+            ctx.reply('❌ O WhatsApp recusou o pedido.\n\n1. Verifique se o número tem o 55.\n2. Espere 15 minutos e tente de novo.\n3. Apague a pasta sessao_viana no Replit.');
         }
     }
 });
@@ -77,19 +85,32 @@ botTelegram.on('text', async (ctx) => {
 botTelegram.action('conectar_wa', (ctx) => {
     const userId = ctx.from.id;
     estadosUsuarios[userId].etapa = 'esperando_numero';
-    ctx.reply('📱 *Coloque o seu número para ser o dono no canal e no chat*\n\nExemplo: 55519XXXXXXXX', { parse_mode: 'Markdown' });
+    ctx.reply('📱 *Mande seu número abaixo (Dono)*\n\nExemplo: 5551994583978', { parse_mode: 'Markdown' });
 });
 
-// --- LÓGICA WHATSAPP (RESPONDE A TODOS) ---
+// --- LÓGICA WHATSAPP ---
 async function startWA() {
     const { state, saveCreds } = await useMultiFileAuthState('sessao_viana');
+    
     sock = makeWASocket({
         auth: state,
         logger: pino({ level: 'silent' }),
-        browser: browser: ["Mac OS", "Safari", "15.1"],
+        // Browser simulando Safari no Mac para maior aceitação do WhatsApp
+        browser: ["Mac OS", "Safari", "15.1"],
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (u) => {
+        const { connection, lastDisconnect } = u;
+        if (connection === 'open') console.log('✅ WhatsApp Conectado com Sucesso!');
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) startWA();
+        }
+    });
 
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
@@ -113,27 +134,34 @@ async function startWA() {
                 let foto;
                 try { foto = await sock.profilePictureUrl(jid, 'image'); } catch { foto = 'https://ui-avatars.com/api/?name=' + nome; }
 
-                // Envia para o destino que o utilizador configurou no Telegram
-                // Nota: Esta lógica assume o destino do último utilizador que configurou. 
-                // Para sistemas multi-utilizador reais, o destino deve ser salvo por JID no DB.
-                const lastUser = Object.values(estadosUsuarios).pop();
-                if (lastUser?.destino) {
-                    await botTelegram.telegram.sendPhoto(lastUser.destino, { url: foto }, { caption: layout, parse_mode: 'Markdown' });
+                // Pega o último destino configurado por qualquer usuário no Telegram
+                const listaEstados = Object.values(estadosUsuarios);
+                const configAtiva = listaEstados.reverse().find(u => u.destino);
+                
+                if (configAtiva?.destino) {
+                    // Envia para o WhatsApp (Canal ou Grupo) se o destino for JID
+                    if (configAtiva.destino.includes('@')) {
+                        await sock.sendMessage(configAtiva.destino, { image: { url: foto }, caption: layout });
+                    } 
+                    // Envia para o Telegram se o destino for ID numérico
+                    else {
+                        await botTelegram.telegram.sendPhoto(configAtiva.destino, { url: foto }, { caption: layout, parse_mode: 'Markdown' });
+                    }
                 }
                 
-                await sock.sendMessage(jid, { text: "✅ Registro Concluído!" });
+                await sock.sendMessage(jid, { text: "✅ *Registro Concluído com Sucesso!*" });
             } else {
-                await sock.sendMessage(jid, { text: "❌ *Acesso Negado!*\n\nRegiste-se para usar:\n/registrar Nome Idade" });
+                await sock.sendMessage(jid, { text: "❌ *Acesso Negado!*\n\nPara usar o sistema, registre-se primeiro:\n👉 */registrar Nome Idade*" });
             }
         }
     });
 }
 
-// Servidor e Inicialização
-app.get('/', (req, res) => res.send('Bot Viana Público Ativo'));
+// Inicialização do Servidor Express para o Replit não dormir
+app.get('/', (req, res) => res.send('Bot Online!'));
 app.listen(3000, async () => {
     await initDb();
     startWA();
     botTelegram.launch();
-    console.log('🚀 Sistema aberto para todos!');
+    console.log('🚀 Sistemas integrados e prontos!');
 });
